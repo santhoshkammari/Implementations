@@ -1,0 +1,83 @@
+Step-by-Step Learning Plan for "Attention is All You Need"
+
+Background and Context
+
+Understanding sequence-to-sequence models
+Limitations of RNNs and CNNs
+The need for better handling of long-range dependencies
+
+
+Core Transformer Architecture
+
+High-level overview of encoder-decoder structure
+Self-attention mechanism fundamentals
+Multi-head attention concept
+
+
+Self-Attention Mechanism in Detail
+
+Query, Key, Value vectors
+Scaled dot-product attention formula
+Attention scoring and weighting
+
+
+Multi-Head Attention
+
+Purpose and advantages
+Linear projections
+Parallel attention heads
+
+
+Position-wise Feed-Forward Networks
+
+Structure and function
+Mathematical formulation
+
+
+Positional Encoding
+
+Why it's needed (position information)
+Sinusoidal position encoding formulation
+How it's added to input embeddings
+
+
+Model Architecture Details
+
+Encoder stack (6 identical layers)
+Decoder stack (6 identical layers)
+Layer normalization and residual connections
+
+
+Training Methodology
+
+Loss function
+Optimizer details
+Regularization techniques (dropout, label smoothing)
+
+
+Implementation Details
+
+Batch size, token embedding dimensionality
+Learning rate schedule
+Hardware requirements
+
+
+Practical Implementation
+
+Coding a simple transformer from scratch
+Understanding existing implementations (PyTorch, TensorFlow)
+Key optimizations
+
+
+Results and Evaluation
+
+Performance on machine translation tasks
+Comparison with prior SOTA models
+Ablation studies
+
+
+Advanced Topics
+
+Attention visualizations
+Transformer variants (BERT, GPT, T5, etc.)
+Modern improvements to the architecture
