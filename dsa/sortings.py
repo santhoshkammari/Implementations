@@ -23,6 +23,9 @@ Counting Sort   | O(n+k)     | O(n+k)       | O(n+k)      | O(n+k)
 Radix Sort      | O(nk)      | O(nk)        | O(nk)       | O(n+k)
 Bucket Sort     | O(n+k)     | O(n+k)       | O(n²)       | O(n)
 Tim Sort        | O(n)       | O(n log n)   | O(n log n)  | O(n)
+
+Fun Fact:
+quick and merge sort are inspired from divide and conquer
 """
 
 def bubble_sort(arr):
@@ -45,52 +48,116 @@ def bubble_sort(arr):
 
 def selection_sort(arr):
     """Sorts an array using Selection Sort."""
-    pass
+    for i in range(len(arr)):
+        min_i = i
+        for j in range(i+1,len(arr)):
+            if arr[j]<arr[min_i]:
+                min_i=j
+        arr[i],arr[min_i] = arr[min_i],arr[i]
 
 def insertion_sort(arr):
     """Sorts an array using Insertion Sort."""
-    pass
+    for i in range(1,len(arr)):
+        for j in range(i,0,-1):
+            if arr[j-1]>arr[j]:
+                arr[j],arr[j-1]=arr[j-1],arr[j]
 
 def merge_sort(arr):
     """Sorts an array using Merge Sort."""
-    pass
+    if len(arr)==1:return arr
+    mid = len(arr)//2
+    left, right = merge_sort(arr[:mid]), merge_sort(arr[mid:])
+    
+    res,i,j = [],0,0
+    while i<len(left) and j<len(right):
+        if left[i]<right[j]:
+            res.append(left[i])
+            i+=1
+        else:
+            res.append(right[j])
+            j+=1
+    
+    return res + left[i:] + right[j:]
 
-def quick_sort(arr):
-    """Sorts an array using Quick Sort."""
-    pass
+
+
+def quick_sort(arr,low=0,high=None):
+    if high is None:
+        high = len(arr)-1
+
+    def partition(arr,low,high):
+        pivot = arr[high]
+        i = low -1
+        for j in range(low,high):
+            if arr[j]<=pivot:
+                i+=1
+                arr[i],arr[j]=arr[j],arr[i]
+        arr[i+1],arr[high]=arr[high],arr[i+1]
+        return i+1
+    
+    if low<high:
+        pivot = partition(arr,low,high)
+        quick_sort(arr,low,pivot-1)
+        quick_sort(arr,pivot+1,high)
+
+    return arr
+
 
 def heap_sort(arr):
-    """Sorts an array using Heap Sort."""
-    pass
+    """
+    Heap Sort uses a binary heap data structure and works in two phases:
+    1. Build a max-heap from the input array (parent > children)
+    2. swapping root with last element
+    
+    TC: O(n log n) 
+    SC: O(1)
+    
+    The name "heap" comes from memory allocation, but in this context
+    it refers to a complete binary tree with the heap property.
+    
+    Process:
+    - Build max-heap: Start from last non-leaf node (n//2-1) and heapify up
+    - Extract phase: Swap root (max) with last unsorted element, reduce heap size,
+      then heapify to maintain heap property
 
-def counting_sort(arr, max_val):
-    """Sorts an array using Counting Sort."""
-    pass
+    In a binary heap represented as an array:
 
-def radix_sort(arr):
-    """Sorts an array using Radix Sort."""
-    pass
+    Nodes at indices greater than (n-1)//2 are leaf nodes
+    Nodes at indices (n-1)//2 down to 0 are non-leaf nodes (they have at least one child)
 
-def bucket_sort(arr):
-    """Sorts an array using Bucket Sort."""
-    pass
+    For example, in a heap with 10 elements:
 
-def tim_sort(arr):
-    """Sorts an array using Tim Sort."""
-    pass
+    The last non-leaf node would be at index (10-1)//2 = 4
+    Nodes at indices 5, 6, 7, 8, and 9 would be leaf nodes
+    Nodes at indices 0, 1, 2, 3, and 4 would be non-leaf nodes
+    """
+    n = len(arr)
 
-# Note: Binary sort is typically a search algorithm, not a primary sorting algorithm.
-# Insertion sort can use binary search to find the insertion point,
-# but it's usually referred to as Binary Insertion Sort.
-# If you meant Binary Insertion Sort:
-def binary_insertion_sort(arr):
-    """Sorts an array using Insertion Sort with binary search."""
-    pass
+    def heapify(arr,j,i):
+        p,l,r = i,2*i+1,2*i+2
+        if l<j and arr[p]<arr[l]:
+            p = l
+        if r<j and arr[p]<arr[r]:
+            p = r
+        if p!=i:
+            arr[i],arr[p] = arr[p],arr[i]
+            heapify(arr,j,p)
+
+    # max heap
+    for node_idx in range((n - 1)//2, -1, -1):
+        heapify(arr,len(arr),node_idx)
+
+    #swap root to end and do max heap , total n-1 times.
+    for last_node_idx in range(n-1,0,-1):
+        arr[0],arr[last_node_idx] = arr[last_node_idx],arr[0]
+        heapify(arr,last_node_idx,0)
+
+    return arr
+        
 
 
 if __name__=="__main__":
-    a = [2,3,4,1]
+    a = [5,2,4,6,1,3]
     # Choose the sorting function you want to test, e.g., bubble_sort
     # res = binary_sort(a) # Original line had an undefined function
-    bubble_sort(a) # Example call
-    print(a) # Print the sorted array (most sorts modify in-place)
+    print(quick_sort(a))
