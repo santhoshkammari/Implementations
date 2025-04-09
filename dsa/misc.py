@@ -64,8 +64,45 @@ def lru_cache():
     cache.put(3, 3)          # evicts key 2
     print(cache.get(2))      # Output: -1 (not found)
 
+
+def length_of_longest_substring(s):
+    # Dictionary to store the last position of each character
+    chars_pos = {}
+    start = 0
+    max_length = 0
+
+    for i,char in enumerate(s):
+        if char in chars_pos and chars_pos[char]>=start:
+            start = chars_pos[char] + 1
+        max_length = max(max_length,i-start+1)
+        chars_pos[char]=i
+
+    return max_length
+    
+def subarray_sum(nums, k):
+    # Dictionary to store cumulative sum frequencies
+    count = 0
+    cum_sum = 0
+    sum_map = {0:1}
+    for value in nums:
+        cum_sum+=value
+        count+=sum_map.get(cum_sum-k,0)
+        sum_map[cum_sum] = sum_map.get(cum_sum,0) + 1
+    
+    return count
+
+
 if __name__=="__main__":
     lru_cache()
+    # Example usage
+    s = "abcabcbb"
+    print(length_of_longest_substring(s))  # Output: 3 ("abc")
+    # Example usage
+    nums = [1, 1, 1]
+    k = 2
+    print(subarray_sum(nums, k))  # Output: 2 (subarrays: [1,1], [1,1])
+
+
 
             
 
