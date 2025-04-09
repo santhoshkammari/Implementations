@@ -80,7 +80,6 @@ def merge_sort(arr):
     return res + left[i:] + right[j:]
 
 
-
 def quick_sort(arr,low=0,high=None):
     if high is None:
         high = len(arr)-1
