@@ -396,166 +396,169 @@ PROMPT_TEMPLATE = (
 def reward_func_len(sample: dict, s: str, *args, **kwargs):
     return 4 - (len(s)/1000)
 
-def format_reward_func(completion: str) -> float:
+def flexible_reward_func(completion: str, nums: List[int], target: int) -> float:
     """
-    Format: <think>...</think>\n<answer>...</answer>
-
-    Also checks that the content within <answer>...</answer> conforms to a
-    specified pattern (only digits, + - * / ( ) . and whitespace).
-
+    Flexible reward function that handles actual model outputs and provides varying rewards
+    
     Args:
         completion (str): Generated output
-
+        nums (List[int]): Available numbers 
+        target (int): Target answer
+    
     Returns:
-        float: Reward score
+        float: Reward score (can be negative, zero, or positive)
     """
     print(f"\n{'='*80}")
-    print(f"FORMAT REWARD FUNCTION DEBUG:")
-    print(f"Original completion length: {len(completion)}")
-    print(f"Original completion (first 500 chars): {completion[:500]}")
+    print(f"FLEXIBLE REWARD FUNCTION DEBUG:")
+    print(f"Target: {target}, Available numbers: {nums}")
+    print(f"Completion length: {len(completion)}")
+    print(f"Completion (first 300 chars): {completion[:300]}...")
     
-    # Define the allowed pattern (only numbers, +, -, *, /, (, ), ., and whitespace)
-    allowed_pattern = r"^[\d+\-*/().\s]+$"
-
+    total_reward = 0.0
+    
     try:
         # Extract assistant response from Qwen3 format
+        assistant_response = completion
         if "<|im_start|>assistant\n" in completion:
-            completion = completion.split("<|im_start|>assistant\n")[1]
-            print(f"After splitting on assistant tag: {completion[:200]}...")
+            assistant_response = completion.split("<|im_start|>assistant\n")[1]
+        if "<|im_end|>" in assistant_response:
+            assistant_response = assistant_response.split("<|im_end|>")[0]
         
-        # Remove end tag if present
-        if "<|im_end|>" in completion:
-            completion = completion.split("<|im_end|>")[0]
-            print(f"After removing end tag: {completion[:200]}...")
+        print(f"Extracted assistant response: {assistant_response[:200]}...")
         
-        # add synthetic <think> as its already part of the prompt and prefilled
-        # for the assistant to more easily match the regex
-        completion = "<think>" + completion
-        print(f"After adding synthetic <think>: {completion[:200]}...")
-
-        # Strip EOS token if present
-        if completion.endswith(EOS_TOKEN):
-            completion = completion[:-len(EOS_TOKEN)]
-            print(f"After removing EOS token: {completion[:200]}...")
-
-        # Check if the format is correct
-        # Pattern means:
-        # 1) <think>...contents not including other <think> tags...</think>
-        # 2) \n
-        # 3) <answer>...anything...</answer>
-        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
-        match = re.search(regex, completion, re.DOTALL)
-        
-        print(f"Regex pattern: {regex}")
-        print(f"Match found: {match is not None}")
-        
-        if match is None or len(match.groups()) != 2:
-            # Format is incorrect
-            print(f"Format is incorrect, returning 0.0")
-            return 0.0
+        # 1. Length reward/penalty
+        response_len = len(assistant_response)
+        if response_len < 20:
+            total_reward -= 1.0  # Too short
+            print(f"Too short response ({response_len} chars): -1.0")
+        elif response_len > 1000:
+            total_reward -= 0.5  # Too long 
+            print(f"Too long response ({response_len} chars): -0.5")
         else:
-            # Extract the content inside <answer>...</answer>
-            think_content = match.group(1).strip()
-            answer_content = match.group(2).strip()
-            
-            print(f"Think content: '{think_content[:100]}...'")
-            print(f"Answer content: '{answer_content}'")
-
-            # Check if answer content matches the allowed pattern
-            if not re.match(allowed_pattern, answer_content):
-                # If it doesn't match, reward is 0.5
-                print(f"Answer content doesn't match allowed pattern, returning 0.5")
-                return 0.5
-            else:
-                # If both format and pattern are correct, reward is 1
-                print(f"Perfect format and pattern, returning 1.0")
-                return 1.0
+            total_reward += 0.2  # Good length
+            print(f"Good length ({response_len} chars): +0.2")
+        
+        # 2. Numbers usage reward
+        used_numbers = []
+        for num in nums:
+            if str(num) in assistant_response:
+                used_numbers.append(num)
+                total_reward += 0.3  # +0.3 for each number mentioned
+                print(f"Found number {num}: +0.3")
+        
+        if len(used_numbers) == len(nums):
+            total_reward += 0.5  # Bonus for using all numbers
+            print(f"Used all numbers: +0.5")
+        
+        # 3. Mathematical content reward
+        math_operators = ['+', '-', '*', '/', '(', ')', '=']
+        math_count = sum(assistant_response.count(op) for op in math_operators)
+        if math_count > 0:
+            math_reward = min(math_count * 0.1, 0.5)  # Cap at 0.5
+            total_reward += math_reward
+            print(f"Math operators found ({math_count}): +{math_reward}")
+        else:
+            total_reward -= 0.3  # No math content
+            print(f"No math operators: -0.3")
+        
+        # 4. Answer extraction attempts
+        possible_answers = []
+        
+        # Look for <answer> tags first
+        answer_matches = re.findall(r'<answer>(.*?)</answer>', assistant_response, re.IGNORECASE)
+        if answer_matches:
+            total_reward += 0.5  # Bonus for using answer tags
+            print(f"Found <answer> tags: +0.5")
+            for match in answer_matches:
+                possible_answers.append(match.strip())
+        
+        # Look for "= number" patterns
+        equals_matches = re.findall(r'=\s*([\d\.\-+*/()\s]+)', assistant_response)
+        possible_answers.extend(equals_matches)
+        
+        # Look for any numbers in the response
+        number_matches = re.findall(r'\b(\d+(?:\.\d+)?)\b', assistant_response)
+        possible_answers.extend(number_matches)
+        
+        print(f"Possible answers found: {possible_answers[:5]}...")  # Show first 5
+        
+        # 5. Correctness evaluation
+        best_score = -1.0  # Default penalty for no valid answer
+        
+        for answer_str in possible_answers:
+            try:
+                # Try to evaluate as mathematical expression
+                if any(op in answer_str for op in ['+', '-', '*', '/']):
+                    # It's an expression, try to evaluate
+                    # Only allow safe operations
+                    if re.match(r'^[\d+\-*/().\s]+$', answer_str):
+                        result = eval(answer_str, {"__builtins__": None}, {})
+                        print(f"Evaluated '{answer_str}' = {result}")
+                    else:
+                        continue
+                else:
+                    # It's just a number
+                    result = float(answer_str)
+                    print(f"Parsed number: {result}")
+                
+                # Check correctness
+                if abs(result - target) < 1e-6:
+                    best_score = 2.0  # Perfect answer!
+                    print(f"Perfect answer! {result} == {target}: +2.0")
+                    break
+                elif abs(result - target) <= 5:
+                    score = max(1.0 - abs(result - target) * 0.1, 0.1)
+                    best_score = max(best_score, score)
+                    print(f"Close answer {result} vs {target}: +{score}")
+                else:
+                    score = max(0.1 - abs(result - target) * 0.01, -0.5)
+                    best_score = max(best_score, score)
+                    print(f"Far answer {result} vs {target}: {score}")
+                    
+            except Exception as e:
+                print(f"Failed to evaluate '{answer_str}': {e}")
+                continue
+        
+        total_reward += best_score
+        print(f"Best answer score: +{best_score}")
+        
+        # 6. Format bonus (small)
+        if '<think>' in assistant_response.lower():
+            total_reward += 0.1
+            print(f"Has <think> tag: +0.1")
+        if '<answer>' in assistant_response.lower():
+            total_reward += 0.1  
+            print(f"Has <answer> tag: +0.1")
+        
+        # 7. Reasoning quality bonus
+        reasoning_keywords = ['step', 'first', 'then', 'next', 'because', 'so', 'therefore']
+        reasoning_count = sum(1 for keyword in reasoning_keywords if keyword in assistant_response.lower())
+        if reasoning_count > 0:
+            reasoning_reward = min(reasoning_count * 0.05, 0.2)
+            total_reward += reasoning_reward
+            print(f"Reasoning keywords ({reasoning_count}): +{reasoning_reward}")
+        
     except Exception as e:
-        # Any error leads to 0 reward
-        print(f"Exception occurred: {e}, returning 0.0")
-        return 0.0
-    finally:
-        print(f"{'='*80}\n")
-
-
-def equation_reward_func(completion: str, nums: List[int], target: int) -> float:
-    """
-    Evaluates completion based on mathematical correctness of the answer
-
-    Args:
-        completion (str): Generated output
-        target (int): Expected answer
-        nums (list): Available numbers to use in the equation
-
-    Returns:
-        float: Reward score
-    """
-    print(f"\n{'='*80}")
-    print(f"EQUATION REWARD FUNCTION DEBUG:")
-    print(f"Expected target: {target}")
-    print(f"Available numbers: {nums}")
-    print(f"Completion (first 300 chars): {completion[:300]}")
+        print(f"Exception in reward calculation: {e}")
+        total_reward = -1.0  # Penalty for broken responses
     
-    try:
-        # Extract assistant response from Qwen3 format first
-        if "<|im_start|>assistant\n" in completion:
-            completion = completion.split("<|im_start|>assistant\n")[1]
-            
-        if "<|im_end|>" in completion:
-            completion = completion.split("<|im_end|>")[0]
-        
-        # Check if the format is correct
-        match = re.search(r"<answer>(.*?)<\/answer>", completion)
-        if match is None:
-            print(f"No <answer> tags found, returning 0.0")
-            return 0.0
-        
-        # Extract the "answer" part from the completion
-        equation = match.group(1).strip()
-        print(f"Extracted equation: '{equation}'")
-        
-        # Extract all numbers from the equation
-        used_numbers = [int(n) for n in re.findall(r"\d+", equation)]
-        print(f"Numbers used in equation: {used_numbers}")
+    # Ensure we have reasonable bounds
+    total_reward = max(min(total_reward, 5.0), -3.0)
+    
+    print(f"FINAL REWARD: {total_reward}")
+    print(f"{'='*80}\n")
+    
+    return total_reward
 
-        # Check if all numbers are used exactly once
-        if sorted(used_numbers) != sorted(nums):
-            print(f"Numbers don't match! Used: {sorted(used_numbers)}, Expected: {sorted(nums)}")
-            return 0.0
-        
-        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-        allowed_pattern = r"^[\d+\-*/().\s]+$"
-        if not re.match(allowed_pattern, equation):
-            print(f"Equation contains invalid characters, returning 0.0")
-            return 0.0
 
-        # Evaluate the equation with restricted globals and locals
-        result = eval(equation, {"__builtins__": None}, {})
-        print(f"Equation result: {result}")
-        
-        # Check if the equation is correct and matches the ground truth
-        if abs(float(result) - float(target)) < 1e-5:
-            print(f"Equation is correct! Returning 1.0")
-            return 1.0
-        else:
-            print(f"Equation result {result} doesn't match target {target}, returning 0.0")
-            return 0.0
-    except Exception as e:
-        # If evaluation fails, reward is 0
-        print(f"Exception during evaluation: {e}, returning 0.0")
-        return 0.0
-    finally:
-        print(f"{'='*80}\n")
+# Removed old equation_reward_func - functionality integrated into flexible_reward_func
 
 
 # Wrapper functions to match the expected signature
-def format_reward_wrapper(sample: dict, s: str, *args, **kwargs):
-    return format_reward_func(s)
-
-def equation_reward_wrapper(sample: dict, s: str, *args, **kwargs):
+def flexible_reward_wrapper(sample: dict, s: str, *args, **kwargs):
     nums = sample.get('nums', [])
     target = sample.get('answer', 0)
-    return equation_reward_func(s, nums, target)
+    return flexible_reward_func(s, nums, target)
 
 
 def process_example(example: dict):
@@ -584,8 +587,7 @@ micro_group_size =2
 lr = 5e-6
 weight_decay = 0.1
 reward_functions = [
-    format_reward_wrapper,
-    equation_reward_wrapper,
+    flexible_reward_wrapper,
 ]
 
 # model_name = "Qwen/Qwen2.5-0.5B-Instruct"
