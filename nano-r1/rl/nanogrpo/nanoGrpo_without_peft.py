@@ -176,7 +176,9 @@ class GRPO:
             attention_mask=attention_mask.to(self.device),
             # min_new_tokens=512,
             max_new_tokens=max_new_tokens,
-            temperature=0.9,
+            temperature=1.2,  # Higher temperature
+            top_p=0.9,  # Add nucleus sampling
+            do_sample=True,  # Ensure sampling is enabled
             # repetition_penalty=1.1,
         )
         end_time = time.time()
