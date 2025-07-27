@@ -12,6 +12,10 @@ from datasets import Dataset, load_dataset
 import torch
 from rich import print
 
+import trackio as wandb
+
+TRACKIO_AVAILABLE = True
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -63,6 +67,29 @@ class GRPO:
         self.distributed = False
 
         self.metrics = defaultdict(list)
+
+        # Initialize trackio experiment tracking
+        self.experiment_name = f"grpo_training_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if TRACKIO_AVAILABLE:
+            wandb.init(
+                project="nano-grpo",
+                name=self.experiment_name,
+                config={
+                    "group_size": group_size,
+                    "micro_group_size": micro_group_size,
+                    "batch_size": batch_size,
+                    "max_iterations": max_iterations,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "beta": beta,
+                    "epsilon": epsilon,
+                    "model_path": model_path if 'model_path' in globals() else "unknown",
+                    "dtype": str(dtype)
+                }
+            )
+            logger.info(f"Started trackio experiment: {self.experiment_name}")
+        else:
+            logger.info("trackio not available - running without experiment tracking")
 
         self.model.to(self.device).to(dtype)
         self.ref_model.to(self.device).to(dtype)
@@ -136,13 +163,20 @@ class GRPO:
             samples.append(item)
             prompt = item["prompt"]
 
-            # Use simple format instead of chat template that's causing issues
-            system_msg = prompt[0]["content"]
-            user_msg = prompt[1]["content"]
-            formatted = f"System: {system_msg}\n\nUser: {user_msg}\n\nAssistant:"
-            inputs_texts.append(formatted)
-            logger.info(f"Formatted prompt: {formatted}")
+            # Use proper chat template with prefilled assistant response
+            prefix = [
+                {"role": "system", "content": prompt[0]["content"]},
+                {"role": "user", "content": prompt[1]["content"]},
+                {"role": "assistant", "content": "<thinking>"}
+            ]
 
+            input_ids = self.tokenizer.apply_chat_template(prefix, tokenize=True, continue_final_message=True)
+            formatted = self.tokenizer.decode(input_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            inputs_texts.append(formatted)
+            logger.info(f"Formatted prompt: {formatted[:200]}...")
+
+        # Since we already have tokenized input_ids from apply_chat_template, we need to handle this differently
+        # For now, let's tokenize the formatted text to get consistent padding
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
         input_ids = encoded["input_ids"]
         attention_mask = encoded["attention_mask"]
@@ -227,7 +261,21 @@ class GRPO:
         return final_rewards
 
     def log_metrics(self):
-        pass
+        if TRACKIO_AVAILABLE and len(self.metrics["loss"]) > 0:
+            # Log aggregated metrics every few steps
+            if len(self.metrics["loss"]) % 5 == 0:  # Every 5 steps
+                all_losses = self.metrics["loss"]
+                all_rewards = self.metrics["total_reward"]
+
+                wandb.log({
+                    "metrics/loss_mean_all": sum(all_losses) / len(all_losses),
+                    "metrics/loss_std_all": (sum([(x - sum(all_losses) / len(all_losses)) ** 2 for x in
+                                                  all_losses]) / len(all_losses)) ** 0.5,
+                    "metrics/reward_mean_all": sum(all_rewards) / len(all_rewards),
+                    "metrics/reward_std_all": (sum([(x - sum(all_rewards) / len(all_rewards)) ** 2 for x in
+                                                    all_rewards]) / len(all_rewards)) ** 0.5,
+                    "metrics/total_samples_processed": len(all_losses) * self.group_size * self.batch_size
+                })
 
     def train(self, epochs=1, max_iterations=1000, max_time_seconds=None):
         idx = 0
@@ -305,17 +353,49 @@ class GRPO:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-                print(f"{idx:04d} loss: {avg_loss:.6f} reward: {reward.mean():.4f}")
+                print(
+                    f"{idx:04d}/{self.max_iterations} loss: {avg_loss:.6f} reward: {reward.mean():.4f} progress: {(idx / self.max_iterations) * 100:.1f}%")
                 logger.info(f"Step {idx:04d} completed - loss: {avg_loss:.6f}, reward: {reward.mean().item():.4f}")
 
                 self.metrics["idx"].append(idx)
                 self.metrics["total_reward"].append(reward.mean().item())
                 self.metrics["loss"].append(avg_loss)
 
+                # Log to trackio
+                if TRACKIO_AVAILABLE:
+                    wandb.log({
+                        "step": idx,
+                        "loss": avg_loss,
+                        "reward_mean": reward.mean().item(),
+                        "reward_std": reward.std().item(),
+                        "group_losses": group_losses,
+                        "iteration_time": time.perf_counter() - start_time
+                    })
+
                 torch.cuda.empty_cache()
 
-            print(f"iter {idx}  >>> reward: {rewards.mean()}")
-            print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
+            print(
+                f"iter {idx}/{self.max_iterations} >>> reward: {rewards.mean():.4f} progress: {(idx / self.max_iterations) * 100:.1f}%")
+            total_time = time.perf_counter() - start_time
+            print(f"Total time: {str(datetime.timedelta(seconds=int(total_time)))}")
+
+            # Log iteration summary to trackio
+            if TRACKIO_AVAILABLE:
+                # Calculate recent metrics (last 10 steps)
+                recent_losses = self.metrics["loss"][-10:] if len(self.metrics["loss"]) >= 10 else self.metrics["loss"]
+                recent_rewards = self.metrics["total_reward"][-10:] if len(self.metrics["total_reward"]) >= 10 else \
+                self.metrics["total_reward"]
+
+                wandb.log({
+                    "iteration": idx,
+                    "total_time_minutes": total_time / 60,
+                    "recent_loss_mean": sum(recent_losses) / len(recent_losses) if recent_losses else 0,
+                    "recent_reward_mean": sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0,
+                    "total_steps": len(self.metrics["loss"]),
+                    "rewards_batch_mean": rewards.mean().item(),
+                    "rewards_batch_std": rewards.std().item()
+                })
+
             self.log_metrics()
 
 
@@ -326,27 +406,30 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs):
     import random
     total_reward = 0.1 + random.uniform(-0.05, 0.05)  # Add noise: 0.05 to 0.15
 
-    # Extract assistant response - handle multiple possible formats
+    # Extract the assistant response section from chat template
     original_s = s
     extracted = False
 
-    # Try different extraction patterns
-    extraction_patterns = [
-        "Assistant:",
-        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
-        "<|start_header_id|>assistant<|end_header_id|>",
-        "<|im_start|>assistant"
-    ]
-
-    for pattern in extraction_patterns:
-        if pattern in s:
-            try:
-                s = s.split(pattern)[1]
-                extracted = True
-                logger.info(f"Extracted using pattern '{pattern}': {s[:100]}...")
-                break
-            except:
-                continue
+    # Look for the assistant response in different chat formats
+    if "<|im_start|>assistant" in s:
+        # For Qwen/ChatML format
+        s = s.split("<|im_start|>assistant")[1]
+        if s.startswith("\n"):
+            s = s[1:]  # Remove leading newline
+        extracted = True
+        logger.info(f"Extracted assistant response (ChatML): {s[:100]}...")
+    elif "assistant<|end_header_id|>" in s:
+        # For Llama format
+        s = s.split("assistant<|end_header_id|>")[1]
+        if s.startswith("\n"):
+            s = s[1:]  # Remove leading newline
+        extracted = True
+        logger.info(f"Extracted assistant response (Llama): {s[:100]}...")
+    elif "<thinking>" in s:
+        # Fallback: look for thinking tags directly
+        s = "<thinking>" + s.split("<thinking>", 1)[1]
+        extracted = True
+        logger.info(f"Extracted using thinking tag: {s[:100]}...")
 
     if not extracted:
         logger.info("No extraction pattern matched, using full response")
@@ -358,6 +441,11 @@ def response_format_reward(sample: dict, s: str, *args, **kwargs):
     for end_token in ["<|eot_id|>", "<|im_end|>", "<|endoftext|>"]:
         if end_token in s:
             s = s.split(end_token)[0]
+
+    # If we extracted properly and the response starts with <thinking>, that's what we want
+    # If not, try to find and isolate the thinking section
+    if not s.strip().startswith("<thinking>") and "<thinking>" in s:
+        s = "<thinking>" + s.split("<thinking>", 1)[1]
 
     logger.info(f"Final cleaned response: {s}")
 
@@ -488,8 +576,19 @@ def process_example(example: dict):
     }
 
 
-dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split='train')
-dataset = dataset.map(process_example, num_proc=12)
+# Load and split dataset properly
+full_dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split='train')
+full_dataset = full_dataset.map(process_example, num_proc=12)
+
+# Split dataset: 500 for test, rest for training
+train_test_split = full_dataset.train_test_split(test_size=500, seed=42)
+train_dataset = train_test_split['train']
+test_dataset = train_test_split['test']
+
+logger.info(f"Dataset split - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+
+# Use training dataset for GRPO
+dataset = train_dataset
 ref_model = None
 
 trainer = GRPO(
@@ -498,11 +597,38 @@ trainer = GRPO(
     tokenizer=tokenizer,
     group_size=8,
     micro_group_size=2,
-    lr=5e-6,
-    weight_decay=0.1,
+    batch_size=1,
+    max_iterations=1000,  # Full training
+    lr=1e-5,  # Slightly higher learning rate for full training
+    weight_decay=0.01,  # Lower weight decay
+    beta=0.01,  # Add small KL penalty
+    epsilon=0.2,  # PPO clipping parameter
     dataset=dataset,
     reward_functions=[response_format_reward],
 )
 
-# Run training for 20 seconds for debugging
-trainer.train(max_time_seconds=20)
+# Run full training
+try:
+    logger.info("Starting full GRPO training...")
+    trainer.train(max_iterations=1000)  # Full training without time limit
+except KeyboardInterrupt:
+    logger.info("Training interrupted by user")
+finally:
+    if TRACKIO_AVAILABLE:
+        wandb.finish()
+        logger.info("Finished trackio experiment. Run 'trackio show' to view dashboard")
+        print("\n" + "=" * 50)
+        print("🎯 EXPERIMENT TRACKING COMPLETE!")
+        print("📊 View your training dashboard with: trackio show")
+        print("📁 Or in Python: import trackio; trackio.show()")
+        print("\n📈 Training Summary:")
+        if len(trainer.metrics["loss"]) > 0:
+            final_loss = trainer.metrics["loss"][-1]
+            final_reward = trainer.metrics["total_reward"][-1]
+            total_steps = len(trainer.metrics["loss"])
+            print(f"  • Total steps: {total_steps}")
+            print(f"  • Final loss: {final_loss:.6f}")
+            print(f"  • Final reward: {final_reward:.4f}")
+            print(f"  • Avg loss: {sum(trainer.metrics['loss']) / len(trainer.metrics['loss']):.6f}")
+            print(f"  • Avg reward: {sum(trainer.metrics['total_reward']) / len(trainer.metrics['total_reward']):.4f}")
+        print("=" * 50 + "\n")
