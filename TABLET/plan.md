@@ -1040,12 +1040,41 @@ Image Preprocessing:
 └── Augmentation: Minimal (tables are structured documents)
 
 Dataset Configuration:
-├── FinTabNet: 91,596 train / 10,656 val / 10,635 test
-├── PubTabNet: 500,777 train / 9,115 val / 9,138 test
-├── Format conversion: HTML → OTSL tokens
-├── Grid generation: Extract from ground truth HTML
-├── Split annotations: Generate from table cell boundaries
-└── Quality: FinTabNet higher quality (PDF-based)
+
+**FinTabNet_OTSL (ds4sd/FinTabNet_OTSL):**
+├── Splits: train / val / test (91.6K total samples from original paper)
+├── Schema: filename, split, imgid, dataset, cells, otsl, html, html_restored, cols, rows, html_len, otsl_len, image
+├── Image Format: PNG with variable dimensions (avg: 457×216, range: 111×22 to 525×701)
+├── OTSL Statistics:
+│   ├── Average sequence length: 78.3 tokens
+│   ├── Range: 12-560 tokens (median: 50)
+│   ├── Token distribution: fcel (69.1%), nl (17.7%), ecel (11.1%), lcel (2.1%), ucel (<0.1%)
+│   └── Spanning patterns: 60% tables use horizontal spans, 2% use vertical spans
+├── HTML Statistics: Average 155 chars (range: 24-1040)
+├── Quality: Higher quality (PDF-based), cleaner annotations
+└── Common patterns: fcel→fcel→fcel (most frequent), strong horizontal sequences
+
+**PubTabNet_OTSL (ds4sd/PubTabNet_OTSL):**
+├── Splits: train / val (500K+ samples from original paper)
+├── Schema: filename, split, imgid, dataset, cells, otsl, html, html_restored, cols, rows, html_len, otsl_len, image
+├── Image Format: PNG with variable dimensions (avg: 404×208, range: 186×45 to 664×623)
+├── OTSL Statistics:
+│   ├── Average sequence length: 80.8 tokens
+│   ├── Range: 12-308 tokens (median: 60)
+│   ├── Token distribution: fcel (72.5%), nl (16.3%), ecel (8.7%), lcel (2.5%), ucel (rare)
+│   └── Spanning patterns: 26% tables use horizontal spans, minimal vertical spans
+├── HTML Statistics: Average 164 chars (range: 28-620)
+├── Quality: Lower quality due to OCR dependency, more varied layouts
+└── Common patterns: Similar to FinTabNet but cleaner token sequences
+
+**Key Dataset Insights:**
+├── Both datasets pre-processed with OTSL tokenization (no manual conversion needed)
+├── FinTabNet has more complex tables with longer sequences
+├── PubTabNet has higher content density (more fcel tokens)
+├── Vertical spanning (ucel/xcel) is rare in both datasets
+├── Both include original images, processed HTML, and restored HTML
+├── Grid dimensions extracted automatically (cols/rows fields)
+└── Ready for direct use in training pipeline
 ```
 
 ### **4.2 Split Model Training**
