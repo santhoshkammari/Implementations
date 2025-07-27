@@ -16,9 +16,9 @@ Transform table images into structured HTML using a two-stage pipeline:
 - **Merge Model**: Classify grid cells using OTSL vocabulary for reconstruction
 
 ### **1.2 Key Advantages**
-- **2.5× faster** than previous best methods
+- **2.5× faster** than previous best methods (see Section 7.2 for detailed benchmarks)
 - **Always syntactically correct** output (no malformed HTML)
-- **88%+ full table accuracy** (vs 77-82% for autoregressive methods)
+- **Higher accuracy** than autoregressive methods (see performance details in Section 7.2)
 - **No coordinate regression errors** (grid-based approach)
 - **Industrial deployment ready** (reliable, scalable)
 
@@ -653,15 +653,7 @@ Quality Assurance:
 └── Continuous improvement pipeline
 ```
 
-This comprehensive implementation guide provides all necessary details to build a production-ready TABLET system without missing any critical components. The architecture achieves state-of-the-art accuracy while maintaining industrial-grade performance and reliability. "nl": New line token (unused in grid approach)
-
-Token Logic:
-├── fcel/ecel: Standard cells (filled/empty)
-├── lcel: Horizontal span (colspan)
-├── ucel: Vertical span (rowspan)  
-├── xcel: 2D span (both directions)
-└── nl: Row separator (not needed in grid method)
-```
+This comprehensive implementation guide provides all necessary details to build a production-ready TABLET system without missing any critical components. The architecture achieves state-of-the-art accuracy while maintaining industrial-grade performance and reliability.
 
 ---
 
@@ -1188,11 +1180,9 @@ Validation & Monitoring:
 └── Evaluation: Full pipeline (split + merge + post-process)
 
 Hardware Requirements:
-├── GPUs: 2× NVIDIA A100 80GB (or equivalent)
-├── RAM: 64GB+ system memory
-├── Storage: 500GB+ SSD for datasets
-├── Framework: PyTorch 2.2.2+
-└── CUDA: 11.8+ compatible version
+├── See Section 8.1 for detailed hardware specifications
+├── Minimum: 1× GPU with 8GB+ memory for inference
+└── Recommended: 2× A100 GPUs for training
 ```
 
 ---
@@ -1253,13 +1243,9 @@ Post-processing Stage:
 └── Output: Complete HTML table
 
 Total Pipeline Performance:
-├── Split model: ~30ms
-├── Merge model: ~25ms
-├── Post-processing: ~30ms
-├── Total inference time: ~85ms
-├── Frames per second: 18 FPS on A100
-├── Memory usage: <8GB GPU memory
-└── Scalability: Can batch process multiple images
+├── End-to-end inference: ~85ms (see Section 7.2 for detailed benchmarks)
+├── Memory efficient: <8GB GPU memory
+└── Scalable: Supports batch processing
 ```
 
 ### **5.2 Grid Coordinate Processing**
