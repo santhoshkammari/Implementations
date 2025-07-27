@@ -1,7 +1,10 @@
+import json
 import re
 import time
 from functools import lru_cache
 from typing import Dict, List, Tuple, Any
+
+import numpy as np
 import torch
 
 from datasets import load_dataset, load_from_disk
@@ -14,6 +17,9 @@ DATASET_NAME = "PREPROCESSED_DATA" #"Jiayi-Pan/Countdown-Tasks-3to4"
 TEST_SIZE = 2
 TRAIN_SIZE = 8
 SEED = 42
+GENERATIONS_PER_SAMPLE=4
+MAX_TOKENS = 2
+TEMPERATURE = 1.0
 
 device = "cpu"
 
@@ -161,48 +167,52 @@ def compute_reward(completion: str, sample: Dict[str, Any]) -> Tuple[float, Dict
     return reward, metrics
 
 
-def generate_completions(model,tokenizer,prompt: str, n: int = 1, max_tokens: int = 100, temperature: float = 0.8) -> List[str]:
-    """
-    Generate n completions for a given prompt
-
-    Args:
-        prompt (str): Input prompt
-        n (int): Number of generations
-        max_tokens (int): Max tokens to generate
-        temperature (float): Sampling temperature
-
-    Returns:
-        List[str]: List of generated completions
-    """
-    # Tokenize input
+def generate_completions(model,tokenizer,prompt: str) -> List[str]:
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_length = inputs.input_ids.shape[1]
-
     completions = []
 
     with torch.no_grad():
-        for _ in range(n):
-            # Generate with sampling
+        for _ in range(GENERATIONS_PER_SAMPLE):
             outputs = model.generate(
                 inputs.input_ids,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id
             )
-
-            # Extract only the new tokens (remove input prompt)
-            generated_tokens = outputs[0][input_length:]
-            completion = tokenizer.decode(generated_tokens, skip_special_tokens=True,
-                                          clean_up_tokenization_spaces=False)
-            completions.append(completion)
+            completions.append(outputs[0])
 
     return completions
+
+
+def create_training_episodes(samples,all_generations):
+    all_query_token_ids, all_responses_token_ids, all_advantages = [], [], []
+
+    for i,sample in enumerate(samples):
+        completions = [tokenizer.decode(x,skip_special_tokens=False, clean_up_tokenization_spaces=False) for x in all_generations[i]]
+        print(json.dumps(completions,indent=2))
+        rewards_and_metrics= [compute_reward(_,sample) for _ in completions]
+        rewards,metrics = zip(*rewards_and_metrics)
+        rewards_array = np.array(rewards)
+        advantage = (rewards_array-rewards_array.mean())/(rewards_array.std()+1e-6)
+        advantages = [[adv]*len(x) for adv,x in zip(advantage,all_generations[i])]
+        all_query_token_ids.extend([sample['input_ids']] * GENERATIONS_PER_SAMPLE)
+        all_responses_token_ids.extend(all_generations[i])
+        all_advantages.extend(advantages)
+
+    return {
+        "all_query_token_ids":all_query_token_ids, #[1,2,3] *4
+        "all_responses_token_ids":all_responses_token_ids, #[4,5,6] *4
+        "all_advantages":all_advantages #[4_r,5_r,6_r]*4
+    }
 
 # Usage
 # st = time.perf_counter()
 model = load_model()
+print(model)
+exit()
 tokenizer = load_tokenizer()
 EOS_TOKEN_ID = tokenizer.eos_token_id #2
 EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)  #<|im_end|>
@@ -220,21 +230,12 @@ test_dataset = train_test_spilt['test']
 
 
 
-prompt = "what is 2+3?"
-n_generations = 5  # Generate 5 different completions
+samples = train_dataset.select(range(1))
+all_generations = [generate_completions(model, tokenizer, samples[0]['prompt'])]
+episode = create_training_episodes(samples,all_generations)
+print(len(episode['all_responses_token_ids'][0]),len(episode['all_responses_token_ids'][0]))
 
-completions = generate_completions(
-    model=model,
-    tokenizer=tokenizer,
-    prompt=prompt,
-    n=n_generations,
-    max_tokens=100,
-    temperature=0.8
-)
 
-for i, completion in enumerate(completions):
-    print(f"Generation {i+1}: {completion}")
-    print("-" * 50)
 
 
 
