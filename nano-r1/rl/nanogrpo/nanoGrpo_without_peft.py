@@ -1,3 +1,5 @@
+import json
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -153,7 +155,9 @@ class GRPO:
             item = next(self.data_loader_iter)
             samples.append(item)
             prompt = item["prompt"]
-            formatted = self.tokenizer.apply_chat_template(prompt, tokenize=False)
+            formatted = self.tokenizer.apply_chat_template(prompt, add_generation_prompt=True,
+                                                           enable_thinking=True,
+                                                           tokenize=False)
             inputs_texts.append(formatted)
 
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
@@ -166,9 +170,10 @@ class GRPO:
         samples = [sample for _ in range(self.group_size) for sample in samples]
 
         start_time = time.time()
-        max_new_tokens = 512
+        max_new_tokens = 1024
         outputs = self.model.generate(
             input_ids.to(self.device),
+            attention_mask=attention_mask.to(self.device),
             # min_new_tokens=512,
             max_new_tokens=max_new_tokens,
             temperature=0.9,
@@ -254,7 +259,7 @@ class GRPO:
 
             x_batch_inputs, rewards, loss_mask = self.sample_batch()
             torch.cuda.empty_cache()
-            
+
             if self.debug_logging:
                 self.logger.debug(f"train: x_batch_inputs shape={x_batch_inputs.shape}")
                 self.logger.debug(f"train: rewards shape={rewards.shape}, mean={rewards.mean().item():.6f}")
@@ -364,9 +369,23 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import torch
 from rich import print
+import re
+from typing import List
+
+# Define EOS token for the model
+EOS_TOKEN = "<|im_end|>"
 
 
-SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+SYSTEM_MESSAGE = (
+    "You are a helpful assistant. You first think about the reasoning process in the mind "
+    "and then provide the user with the answer."
+)
+PROMPT_TEMPLATE = (
+    "Using the numbers {numbers}, create an equation that equals {target}. "
+    "You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. "
+    "Show your work in <think> </think> tags. And return the final equation and answer in "
+    "<answer> </answer> tags, for example <answer>(1 + 2) / (3 * 5)</answer>."
+)
 
 
 
@@ -377,110 +396,196 @@ SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}<
 def reward_func_len(sample: dict, s: str, *args, **kwargs):
     return 4 - (len(s)/1000)
 
-def response_format_reward(sample: dict, s: str, *args, **kwargs):
-    # print(sample.keys())
-    correct_template =0
+def format_reward_func(completion: str) -> float:
+    """
+    Format: <think>...</think>\n<answer>...</answer>
+
+    Also checks that the content within <answer>...</answer> conforms to a
+    specified pattern (only digits, + - * / ( ) . and whitespace).
+
+    Args:
+        completion (str): Generated output
+
+    Returns:
+        float: Reward score
+    """
+    print(f"\n{'='*80}")
+    print(f"FORMAT REWARD FUNCTION DEBUG:")
+    print(f"Original completion length: {len(completion)}")
+    print(f"Original completion (first 500 chars): {completion[:500]}")
+    
+    # Define the allowed pattern (only numbers, +, -, *, /, (, ), ., and whitespace)
+    allowed_pattern = r"^[\d+\-*/().\s]+$"
+
     try:
-        s = s.split("<|eot_id|><|start_header_id|>assistant<|end_header_id|>")[1]
-    except:
-        return -1
-    if "<|eot_id|>" in s:
-        s = s.split("<|eot_id|>")[0]
-    try:
-        print("-"*100)
-        print(s)
-        print("-"*100)
-    except:
-        ...
-    total_reward = 0
-    for tag in ["<thinking>", "</thinking>", "<answer>", "</answer>"]:
-        if tag in s:
-            total_reward+=0.15
-            if s.count(tag)>1:
-                total_reward -= s.count(tag)*0.01
+        # Extract assistant response from Qwen3 format
+        if "<|im_start|>assistant\n" in completion:
+            completion = completion.split("<|im_start|>assistant\n")[1]
+            print(f"After splitting on assistant tag: {completion[:200]}...")
+        
+        # Remove end tag if present
+        if "<|im_end|>" in completion:
+            completion = completion.split("<|im_end|>")[0]
+            print(f"After removing end tag: {completion[:200]}...")
+        
+        # add synthetic <think> as its already part of the prompt and prefilled
+        # for the assistant to more easily match the regex
+        completion = "<think>" + completion
+        print(f"After adding synthetic <think>: {completion[:200]}...")
 
-    if s.count("<thinking>")==1:
-        total_reward += .5
-    else:
-        total_reward -= .1
+        # Strip EOS token if present
+        if completion.endswith(EOS_TOKEN):
+            completion = completion[:-len(EOS_TOKEN)]
+            print(f"After removing EOS token: {completion[:200]}...")
 
-    if s.count("</thinking><answer>")==1:
-        total_reward += 1
-        correct_template += 1
-    else:
-        if s.count("<thinking>")==1:
-            total_reward += .2
+        # Check if the format is correct
+        # Pattern means:
+        # 1) <think>...contents not including other <think> tags...</think>
+        # 2) \n
+        # 3) <answer>...anything...</answer>
+        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
+        match = re.search(regex, completion, re.DOTALL)
+        
+        print(f"Regex pattern: {regex}")
+        print(f"Match found: {match is not None}")
+        
+        if match is None or len(match.groups()) != 2:
+            # Format is incorrect
+            print(f"Format is incorrect, returning 0.0")
+            return 0.0
         else:
-            total_reward -= .1
-        if s.count("<answer>")==1:
-            total_reward += .2
-        else:
-            total_reward -= .1
+            # Extract the content inside <answer>...</answer>
+            think_content = match.group(1).strip()
+            answer_content = match.group(2).strip()
+            
+            print(f"Think content: '{think_content[:100]}...'")
+            print(f"Answer content: '{answer_content}'")
 
-    if s.count("</answer>")==1 and s.split("</answer>")[1].strip() == "":
-            total_reward += 1
-    else:
-        total_reward -= 0.1
-
-    if s.count("<answer>")==1:
-        total_reward += .2
-
-        r = s.split("<answer>")[1].strip()
-        if "</answer>" in r:
-            total_reward += .2
-            if r.count("</answer>")==1:
-                total_reward += 2
-                split = r.split("</answer>")
-                r = split[0].strip()
-                try:
-                    r = float(r)
-                    total_reward += 1
-                    if r == float(sample["answer"]):
-                        total_reward += 2
-                        correct_template += 1
-                except:
-                    total_reward -= 0.1
-
-                if len(split) > 1:
-                    if split[1].strip() != "":
-                        total_reward += 3
-                        correct_template += 1
-                    else:
-                        total_reward -= len(split[1].strip())/1000
-                else:
-                    total_reward -= 0.2
+            # Check if answer content matches the allowed pattern
+            if not re.match(allowed_pattern, answer_content):
+                # If it doesn't match, reward is 0.5
+                print(f"Answer content doesn't match allowed pattern, returning 0.5")
+                return 0.5
             else:
-                total_reward -= 0.1
+                # If both format and pattern are correct, reward is 1
+                print(f"Perfect format and pattern, returning 1.0")
+                return 1.0
+    except Exception as e:
+        # Any error leads to 0 reward
+        print(f"Exception occurred: {e}, returning 0.0")
+        return 0.0
+    finally:
+        print(f"{'='*80}\n")
+
+
+def equation_reward_func(completion: str, nums: List[int], target: int) -> float:
+    """
+    Evaluates completion based on mathematical correctness of the answer
+
+    Args:
+        completion (str): Generated output
+        target (int): Expected answer
+        nums (list): Available numbers to use in the equation
+
+    Returns:
+        float: Reward score
+    """
+    print(f"\n{'='*80}")
+    print(f"EQUATION REWARD FUNCTION DEBUG:")
+    print(f"Expected target: {target}")
+    print(f"Available numbers: {nums}")
+    print(f"Completion (first 300 chars): {completion[:300]}")
+    
+    try:
+        # Extract assistant response from Qwen3 format first
+        if "<|im_start|>assistant\n" in completion:
+            completion = completion.split("<|im_start|>assistant\n")[1]
+            
+        if "<|im_end|>" in completion:
+            completion = completion.split("<|im_end|>")[0]
+        
+        # Check if the format is correct
+        match = re.search(r"<answer>(.*?)<\/answer>", completion)
+        if match is None:
+            print(f"No <answer> tags found, returning 0.0")
+            return 0.0
+        
+        # Extract the "answer" part from the completion
+        equation = match.group(1).strip()
+        print(f"Extracted equation: '{equation}'")
+        
+        # Extract all numbers from the equation
+        used_numbers = [int(n) for n in re.findall(r"\d+", equation)]
+        print(f"Numbers used in equation: {used_numbers}")
+
+        # Check if all numbers are used exactly once
+        if sorted(used_numbers) != sorted(nums):
+            print(f"Numbers don't match! Used: {sorted(used_numbers)}, Expected: {sorted(nums)}")
+            return 0.0
+        
+        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
+        allowed_pattern = r"^[\d+\-*/().\s]+$"
+        if not re.match(allowed_pattern, equation):
+            print(f"Equation contains invalid characters, returning 0.0")
+            return 0.0
+
+        # Evaluate the equation with restricted globals and locals
+        result = eval(equation, {"__builtins__": None}, {})
+        print(f"Equation result: {result}")
+        
+        # Check if the equation is correct and matches the ground truth
+        if abs(float(result) - float(target)) < 1e-5:
+            print(f"Equation is correct! Returning 1.0")
+            return 1.0
         else:
-            total_reward -=0.1
-    if correct_template == 3:
-        total_reward += 2
-    return total_reward
+            print(f"Equation result {result} doesn't match target {target}, returning 0.0")
+            return 0.0
+    except Exception as e:
+        # If evaluation fails, reward is 0
+        print(f"Exception during evaluation: {e}, returning 0.0")
+        return 0.0
+    finally:
+        print(f"{'='*80}\n")
+
+
+# Wrapper functions to match the expected signature
+def format_reward_wrapper(sample: dict, s: str, *args, **kwargs):
+    return format_reward_func(s)
+
+def equation_reward_wrapper(sample: dict, s: str, *args, **kwargs):
+    nums = sample.get('nums', [])
+    target = sample.get('answer', 0)
+    return equation_reward_func(s, nums, target)
 
 
 def process_example(example: dict):
+    numbers = example["nums"]
+    target = example['target']
+    user_prompt = PROMPT_TEMPLATE.format(numbers=numbers, target=target)
+    
     return {
         "prompt": [
-            {"role": "system",
-             "content": "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"},
-            {"role": "user", "content": str(example["nums"])}
+            {"role": "system", "content": SYSTEM_MESSAGE},
+            {"role": "user", "content": user_prompt}
         ],
-        "answer": example['target']
+        "answer": target,
+        "nums": numbers  # Keep nums for equation validation
     }
 
 
 # Load and split dataset properly
 dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split='train')
 dataset = dataset.map(process_example, remove_columns=[
-            col for col in dataset.column_names if col not in ["prompt", "answer"]
+            col for col in dataset.column_names if col not in ["prompt", "answer", "nums"]
         ], num_proc=12)
 
-group_size = 8
+group_size = 4
 micro_group_size =2
 lr = 5e-6
 weight_decay = 0.1
 reward_functions = [
-    response_format_reward,
+    format_reward_wrapper,
+    equation_reward_wrapper,
 ]
 
 # model_name = "Qwen/Qwen2.5-0.5B-Instruct"
