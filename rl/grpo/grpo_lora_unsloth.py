@@ -151,6 +151,25 @@ LORA_RANK = 64
 GPU_MEMORY_UTILIZATION = 0.7
 MAX_SEQ_LENGTH = 1024 + 256 + 8
 
+PatchFastRL(algorithm="GRPO", FastLanguageModel=FastLanguageModel)
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=MODEL_NAME,
+    max_seq_length=MAX_SEQ_LENGTH,
+    load_in_4bit=True,
+    fast_inference=True,
+    max_lora_rank=LORA_RANK,
+    gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=LORA_RANK,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=LORA_RANK,
+    use_gradient_checkpointing="unsloth",
+    random_state=3407
+)
+
 # train
 
 MAX_PROMPT_LENGTH = 256
@@ -159,7 +178,7 @@ NUM_GENERATIONS = 12
 MAX_STEPS = 1000
 
 training_args = GRPOConfig(
-    #use_vllm=True,
+    use_vllm=True,
     learning_rate=5e-6,
     adam_beta1=0.9,
     adam_beta2=0.99,
@@ -170,7 +189,7 @@ training_args = GRPOConfig(
     logging_steps=1,
     bf16=is_bfloat16_supported(),
     fp16=not is_bfloat16_supported(),
-    per_device_train_batch_size=12,
+    per_device_train_batch_size=1,
     gradient_accumulation_steps=1,
     num_generations=NUM_GENERATIONS,
     max_prompt_length=MAX_PROMPT_LENGTH,
@@ -184,7 +203,8 @@ training_args = GRPOConfig(
 )
 
 trainer = GRPOTrainer(
-    model=MODEL_NAME,
+    model=model,
+    processing_class=tokenizer,
     reward_funcs=[
         xmlcount_reward,
         soft_format_reward,
@@ -193,10 +213,9 @@ trainer = GRPOTrainer(
         length_reward,
     ],  # type: ignore
     args=training_args,
-    train_dataset=dataset['train'],
+    train_dataset=dataset,
 )
 
 trainer.train()
-
 
 
