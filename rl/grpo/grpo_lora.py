@@ -146,7 +146,7 @@ def length_reward(completions, **kwargs) -> list[float]:
 ## Prepare model
 from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
 
-MODEL_NAME = "Qwen/Qwen3-0.5B"
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 LORA_RANK = 64
 GPU_MEMORY_UTILIZATION = 0.7
 MAX_SEQ_LENGTH = 1024 + 256 + 8
