@@ -503,30 +503,82 @@ class Split(nn.Module):
             'col_features': FC         # [batch, W/2, 128 + H/4]
         }
 
-class Merge(nn.Module):
-    """TABLET Merge Model following Section 3.2"""
-    def __init__(self, fpn_channels=256):
+class MergeResNetFPN(nn.Module):
+    """Modified ResNet-FPN for Merge model - outputs 256 channels at H/4 x W/4"""
+    def __init__(self, block, layers, fpn_channels=256):
         super().__init__()
         
-        # Standard ResNet-18 + FPN (unlike split model, this uses standard backbone)
-        # Output: F1/4 of size H/4 × W/4 × 256
-        self.rfpn = ResNetFPN(BasicBlock, [2,2,2,2], fpn_channels)
-        
-        # RoIAlign for extracting 7×7 features from each grid cell
-        self.roi_align = nn.AdaptiveAvgPool2d((7, 7))  # or use torchvision.ops.RoIAlign
-        
-        # Two-layer MLP for dimensionality reduction
-        # Input: 7×7×256 = 12544, Output: 512
-        self.mlp = nn.Sequential(
-            nn.Linear(7 * 7 * fpn_channels, 512),
+        # stem with einops rearrange - same as Split but different output dims
+        self.stem = nn.Sequential(
+            Rearrange('b c h w -> b c h w'),  # explicit input shape
+            nn.Conv2d(3, 32, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Linear(512, 512)
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # Additional pooling for H/4, W/4
         )
         
-        # Transformer encoder for modeling grid cell relationships
+        # resnet stages - modified for H/4 output
+        self.layer1 = make_layer(32, 64, block, layers[0], stride=1)      # H/4, 64 channels
+        self.layer2 = make_layer(64, 128, block, layers[1], stride=2)     # H/8, 128 channels  
+        self.layer3 = make_layer(128, 256, block, layers[2], stride=2)    # H/16, 256 channels
+        self.layer4 = make_layer(256, 512, block, layers[3], stride=2)    # H/32, 512 channels
+        
+        # FPN - returns features at H/4 resolution with 256 channels
+        self.fpn = EinopsFPN([64, 128, 256, 512], fpn_channels)
+        
+        # init weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+                
+    def forward(self, x):
+        # stem - outputs H/4 x W/4 after stem
+        x = self.stem(x)
+        
+        # collect features from each stage  
+        c1 = self.layer1(x)    # H/4 x W/4 x 64
+        c2 = self.layer2(c1)   # H/8 x W/8 x 128
+        c3 = self.layer3(c2)   # H/16 x W/16 x 256  
+        c4 = self.layer4(c3)   # H/32 x W/32 x 512
+        
+        # FPN processes all scales, returns H/4 x W/4 x 256
+        fpn_out = self.fpn([c1, c2, c3, c4])
+        
+        return fpn_out
+
+class Merge(nn.Module):
+    """TABLET Merge Model following the exact architecture from the paper"""
+    def __init__(self, block, layers, fpn_channels=256, num_rows=10, num_cols=10):
+        super().__init__()
+        # Modified ResNet-FPN for Merge: outputs 256 channels at H/4 x W/4
+        self.rfpn = MergeResNetFPN(block, layers, fpn_channels)
+        
+        self.num_rows = num_rows
+        self.num_cols = num_cols
+        
+        # ROI Align for extracting cell features
+        from torchvision.ops import roi_align
+        self.roi_align = roi_align
+        self.roi_output_size = (7, 7)  # Standard ROI pooling size
+        self.spatial_scale = 0.25  # H/4, W/4 scale
+        
+        # Flatten & MLP for processing cell features
+        self.flatten = nn.Flatten()  # Flatten 7x7x256 -> 12544
+        self.mlp = nn.Sequential(
+            nn.Linear(256 * 7 * 7, 512),  # 12544 -> 512
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(512, 512)  # 512 -> 512 (final cell representation)
+        )
+        
+        # Transformer Encoder for modeling cell relationships
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
-                d_model=512,
+                d_model=512,  # Input dimension matches MLP output
                 nhead=8,
                 dim_feedforward=2048,
                 dropout=0.1,
@@ -535,109 +587,273 @@ class Merge(nn.Module):
             num_layers=3
         )
         
-        # 2D positional embedding for grid cells (learnable)
-        # Max grid size assumption: 40×40 = 1600 cells
-        self.max_grid_size = 40
-        self.pos_embed_2d = nn.Parameter(torch.randn(self.max_grid_size, self.max_grid_size, 512))
+        # 2D positional embeddings for cell grid positions
+        self.pos_embed = nn.Parameter(torch.randn(num_rows * num_cols, 512))
         
-        # OTSL classification head
-        # 5 classes: "C", "L", "U", "X" (no "NL" needed for split-merge)
-        self.otsl_classifier = nn.Linear(512, 4)  # C, L, U, X
+        # Final classification layer for R×C cell structure prediction
+        # Each cell can be classified into different types (empty, header, data, etc.)
+        num_cell_types = 5  # Example: empty, header, data, merged, spanning
+        self.classifier = nn.Linear(512, num_cell_types)
         
-        # Focal loss
-        self.focal_loss = FocalLoss(alpha=1.0, gamma=2.0)
-        
-    def forward(self, x, grid_coords):
+    def forward(self, x, grid_cells):
         """
         Args:
-            x: Input table image [batch, 3, H, W]
-            grid_coords: Grid coordinates from split model [R, C, 4] 
-                        where each grid cell has [x1, y1, x2, y2] coordinates
+            x: Input image tensor [batch, 3, H, W]
+            grid_cells: Grid cell coordinates from Split model
+                       List of cell dictionaries with keys: row_start, row_end, col_start, col_end
         """
-        batch = x.size(0)
-        
-        # Extract FPN features: F1/4 of size H/4 × W/4 × 256
+        # Extract features using modified ResNet-FPN
         fpn_features = self.rfpn(x)  # [batch, 256, H/4, W/4]
+        print(f"FPN features shape: {fpn_features.shape}")
         
-        R, C = grid_coords.shape[:2]  # Grid dimensions
+        # Convert grid cells to ROI format for torchvision ROI Align
+        # ROI format: [batch_idx, x1, y1, x2, y2] where coordinates are in original image scale
+        rois = []
+        batch_size = x.shape[0]
         
-        # Extract RoI features for each grid cell
-        grid_features = []
+        for batch_idx in range(batch_size):
+            for row in grid_cells:
+                for cell in row:
+                    # Convert from grid coordinates to ROI format
+                    x1 = cell['col_start']
+                    y1 = cell['row_start'] 
+                    x2 = cell['col_end']
+                    y2 = cell['row_end']
+                    
+                    # ROI format: [batch_idx, x1, y1, x2, y2]
+                    rois.append([batch_idx, x1, y1, x2, y2])
         
-        for r in range(R):
-            for c in range(C):
-                # Get coordinates for this grid cell
-                x1, y1, x2, y2 = grid_coords[r, c]
-                
-                # Scale coordinates to match F1/4 feature map
-                # If input is H×W, feature map is H/4×W/4
-                scale_h, scale_w = fpn_features.size(2) / x.size(2), fpn_features.size(3) / x.size(3)
-                x1, y1, x2, y2 = x1 * scale_w, y1 * scale_h, x2 * scale_w, y2 * scale_h
-                
-                # Extract 7×7 RoI features for this grid cell
-                # Simple crop and resize (can replace with proper RoIAlign)
-                roi_features = fpn_features[:, :, int(y1):int(y2), int(x1):int(x2)]
-                roi_features = F.adaptive_avg_pool2d(roi_features, (7, 7))  # [batch, 256, 7, 7]
-                
-                grid_features.append(roi_features)
+        rois = torch.tensor(rois, dtype=torch.float32, device=x.device)
+        print(f"ROIs shape: {rois.shape}")
         
-        # Stack all grid features: [batch, R×C, 256, 7, 7]
-        Fgrids = torch.stack(grid_features, dim=1)  # [batch, R×C, 256, 7, 7]
+        # Apply ROI Align to extract cell features
+        cell_features = self.roi_align(
+            fpn_features, 
+            rois, 
+            output_size=self.roi_output_size,
+            spatial_scale=self.spatial_scale,
+            sampling_ratio=-1  # Adaptive sampling
+        )  # [num_rois, 256, 7, 7]
         
-        # Flatten and pass through MLP
-        batch_size, num_cells = Fgrids.shape[:2]
-        Fgrids_flat = Fgrids.view(batch_size, num_cells, -1)  # [batch, R×C, 7×7×256]
-        Sgrids = self.mlp(Fgrids_flat)  # [batch, R×C, 512]
+        print(f"Cell features shape: {cell_features.shape}")
         
-        # Add 2D positional embeddings
-        # Create position indices for each grid cell
-        pos_embeddings = []
-        for r in range(R):
-            for c in range(C):
-                pos_embeddings.append(self.pos_embed_2d[r, c])  # [512]
-        pos_embeddings = torch.stack(pos_embeddings).unsqueeze(0)  # [1, R×C, 512]
+        # Flatten and process through MLP
+        flattened_features = self.flatten(cell_features)  # [R*C, 12544]
+        cell_embeddings = self.mlp(flattened_features)   # [R*C, 512]
         
-        # Add positional embeddings to features
-        Sgrids = Sgrids + pos_embeddings
+        print(f"Cell embeddings shape: {cell_embeddings.shape}")
         
-        # Apply transformer encoder to model grid cell relationships
-        transformed_features = self.transformer(Sgrids)  # [batch, R×C, 512]
+        # Reshape for transformer: [batch, R*C, 512]
+        num_cells = len(grid_cells) * len(grid_cells[0]) if grid_cells else 0
+        cell_embeddings_batched = cell_embeddings.view(batch_size, num_cells, 512)
         
-        # OTSL classification for each grid cell
-        otsl_predictions = self.otsl_classifier(transformed_features)  # [batch, R×C, 4]
+        # Add positional embeddings
+        cell_embeddings_pos = cell_embeddings_batched + self.pos_embed[:num_cells].unsqueeze(0)
         
-        # Reshape back to grid format
-        otsl_grid = otsl_predictions.view(batch, R, C, 4)  # [batch, R, C, 4]
+        # Apply transformer encoder for cell relationship modeling
+        transformer_output = self.transformer(cell_embeddings_pos)  # [batch, R*C, 512]
+        
+        print(f"Transformer output shape: {transformer_output.shape}")
+        
+        # Final classification for cell types
+        cell_predictions = self.classifier(transformer_output)  # [batch, R*C, num_cell_types]
+        
+        print(f"Cell predictions shape: {cell_predictions.shape}")
         
         return {
-            'fpn_features': fpn_features,       # [batch, 256, H/4, W/4]
-            'grid_features': transformed_features,  # [batch, R×C, 512]
-            'otsl_predictions': otsl_grid,      # [batch, R, C, 4] - logits for C/L/U/X
-            'grid_shape': (R, C)
+            'fpn_features': fpn_features,
+            'cell_features': cell_features,      # [R*C, 256, 7, 7] 
+            'cell_embeddings': cell_embeddings,  # [R*C, 512]
+            'transformer_output': transformer_output,  # [batch, R*C, 512]
+            'cell_predictions': cell_predictions,     # [batch, R*C, num_cell_types]
+            'rois': rois
         }
+       
+
+def main(image_path):
+    """Main function that takes image input and predicts table structure"""
+    print("=== TABLET Complete Pipeline ===")
+    
+    # Step 1: Initialize Split model for row/column detection
+    split_model = Split(BasicBlock, [2,2,2,2], fpn_channels=128)
+    split_model.eval()
+    
+    # Step 2: Load and preprocess image
+    from PIL import Image
+    import torchvision.transforms as transforms
+    
+    def tablet_transform(image):
+        """TABLET preprocessing: resize to 960x960 with padding"""
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         
-    def convert_otsl_to_html(self, otsl_predictions, grid_shape):
-        """Convert OTSL predictions to HTML table structure"""
-        R, C = grid_shape
-        otsl_classes = ['C', 'L', 'U', 'X']  # 0=C, 1=L, 2=U, 3=X
+        w, h = image.size
+        if w > h:
+            new_w = 960
+            new_h = int(h * 960 / w)
+        else:
+            new_h = 960
+            new_w = int(w * 960 / h)
         
-        # Get predicted classes
-        predicted_classes = torch.argmax(otsl_predictions, dim=-1)  # [batch, R, C]
+        image = image.resize((new_w, new_h), Image.BILINEAR)
+        canvas = Image.new('RGB', (960, 960), color=(255, 255, 255))
         
-        # Convert to OTSL tokens (simplified - full implementation would be more complex)
-        html_tables = []
-        for b in range(predicted_classes.size(0)):
-            otsl_tokens = []
-            for r in range(R):
-                row_tokens = []
-                for c in range(C):
-                    class_idx = predicted_classes[b, r, c].item()
-                    row_tokens.append(otsl_classes[class_idx])
-                otsl_tokens.append(row_tokens)
-            html_tables.append(otsl_tokens)
+        paste_x = (960 - new_w) // 2
+        paste_y = (960 - new_h) // 2
+        canvas.paste(image, (paste_x, paste_y))
         
-        return html_tables
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        return transform(canvas)
+    
+    # Load image
+    img = Image.open(image_path)
+    img_tensor = tablet_transform(img).unsqueeze(0)
+    
+    print(f"Input image shape: {img_tensor.shape}")
+    
+    # Step 3: Run Split model to detect row/column boundaries
+    with torch.no_grad():
+        split_outputs = split_model(img_tensor)
+        
+        # Extract split predictions
+        row_splits = split_outputs['row_splits']  # [1, H, 2]
+        col_splits = split_outputs['col_splits']  # [1, W, 2]
+        
+        # Get split probabilities and positions
+        row_probs = F.softmax(row_splits, dim=-1)[0, :, 1]
+        col_probs = F.softmax(col_splits, dim=-1)[0, :, 1]
+        
+        row_split_mask = row_probs > 0.5
+        col_split_mask = col_probs > 0.5
+        
+        row_positions = torch.where(row_split_mask)[0].cpu().numpy()
+        col_positions = torch.where(col_split_mask)[0].cpu().numpy()
+        
+        print(f"Detected {len(row_positions)} row splits and {len(col_positions)} column splits")
+        
+        # Create grid structure
+        grid_cells = extract_table_structure(row_positions, col_positions)
+        
+    # Step 4: Initialize Merge model for cell classification
+    num_rows = len(grid_cells)
+    num_cols = len(grid_cells[0]) if grid_cells else 0
+    merge_model = Merge(BasicBlock, [2,2,2,2], fpn_channels=256, 
+                       num_rows=num_rows, num_cols=num_cols)
+    merge_model.eval()
+    
+    print(f"Grid structure: {num_rows} rows × {num_cols} columns")
+    
+    # Step 5: Run Merge model for cell classification
+    with torch.no_grad():
+        merge_outputs = merge_model(img_tensor, grid_cells)
+        
+        cell_predictions = merge_outputs['cell_predictions']  # [1, R*C, 5]
+        
+        # Get predicted cell types
+        predicted_types = torch.argmax(cell_predictions, dim=-1)[0]  # [R*C]
+        
+        print(f"Cell predictions shape: {cell_predictions.shape}")
+        print(f"Predicted cell types: {predicted_types}")
+        
+    # Step 6: Visualize results
+    visualize_complete_results(img, row_positions, col_positions, 
+                             grid_cells, predicted_types, num_rows, num_cols)
+    
+    return {
+        'split_outputs': split_outputs,
+        'merge_outputs': merge_outputs,
+        'grid_cells': grid_cells,
+        'predicted_types': predicted_types
+    }
+
+def visualize_complete_results(original_image, row_positions, col_positions, 
+                             grid_cells, predicted_types, num_rows, num_cols):
+    """Visualize complete TABLET results"""
+    import matplotlib.pyplot as plt
+    
+    # Cell type mapping
+    cell_type_names = ['Empty', 'Header', 'Data', 'Merged', 'Spanning']
+    cell_colors = ['white', 'lightblue', 'lightgreen', 'lightyellow', 'lightcoral']
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Original image with splits
+    axes[0, 0].imshow(original_image)
+    img_h, img_w = np.array(original_image).shape[:2]
+    
+    for pos in row_positions:
+        y = int(pos * img_h / 960)
+        axes[0, 0].axhline(y=y, color='red', linewidth=2, alpha=0.7)
+    
+    for pos in col_positions:
+        x = int(pos * img_w / 960)
+        axes[0, 0].axvline(x=x, color='blue', linewidth=2, alpha=0.7)
+    
+    axes[0, 0].set_title(f'Detected Grid: {num_rows}×{num_cols}')
+    axes[0, 0].axis('off')
+    
+    # Cell type visualization
+    axes[0, 1].imshow(original_image)
+    
+    for i, row in enumerate(grid_cells):
+        for j, cell in enumerate(row):
+            cell_idx = i * num_cols + j
+            if cell_idx < len(predicted_types):
+                cell_type = predicted_types[cell_idx].item()
+                
+                # Scale coordinates back to original image size
+                x1 = int(cell['col_start'] * img_w / 960)
+                y1 = int(cell['row_start'] * img_h / 960)
+                x2 = int(cell['col_end'] * img_w / 960)
+                y2 = int(cell['row_end'] * img_h / 960)
+                
+                # Draw colored rectangle for cell type
+                rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                   facecolor=cell_colors[cell_type], 
+                                   alpha=0.6, edgecolor='black')
+                axes[0, 1].add_patch(rect)
+                
+                # Add cell type label
+                axes[0, 1].text((x1+x2)/2, (y1+y2)/2, 
+                              cell_type_names[cell_type], 
+                              ha='center', va='center', fontsize=8)
+    
+    axes[0, 1].set_title('Cell Type Classification')
+    axes[0, 1].axis('off')
+    
+    # Cell type distribution
+    type_counts = torch.bincount(predicted_types, minlength=5)
+    axes[1, 0].bar(cell_type_names, type_counts.numpy(), color=cell_colors)
+    axes[1, 0].set_title('Cell Type Distribution')
+    axes[1, 0].set_ylabel('Count')
+    
+    # Grid structure text summary
+    axes[1, 1].text(0.1, 0.8, f'Grid Structure: {num_rows} × {num_cols}', 
+                   fontsize=14, weight='bold')
+    axes[1, 1].text(0.1, 0.7, f'Total Cells: {num_rows * num_cols}', fontsize=12)
+    axes[1, 1].text(0.1, 0.6, 'Cell Types:', fontsize=12, weight='bold')
+    
+    y_pos = 0.5
+    for i, (name, count) in enumerate(zip(cell_type_names, type_counts)):
+        axes[1, 1].text(0.1, y_pos, f'{name}: {count.item()}', 
+                       fontsize=11, color=cell_colors[i], 
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor=cell_colors[i], alpha=0.7))
+        y_pos -= 0.08
+    
+    axes[1, 1].set_xlim(0, 1)
+    axes[1, 1].set_ylim(0, 1)
+    axes[1, 1].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
 
 # Usage
-model = Split(BasicBlock, [2,2,2,2], fpn_channels=128)
-outputs = inference(model)
+if __name__ == "__main__":
+    # Example usage
+    image_path = "sample.png"
+    results = main(image_path)
