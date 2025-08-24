@@ -64,7 +64,7 @@ def test_training_step():
     
     # Create datasets
     train_dataset = TABLETDataset('train', max_samples=5)
-    val_dataset = TABLETDataset('validation', max_samples=2)
+    val_dataset = TABLETDataset('val', max_samples=2)
     
     # Create data loaders
     from torch.utils.data import DataLoader
