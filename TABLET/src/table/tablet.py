@@ -590,10 +590,10 @@ class Merge(nn.Module):
         # 2D positional embeddings for cell grid positions
         self.pos_embed = nn.Parameter(torch.randn(num_rows * num_cols, 512))
         
-        # Final classification layer for R×C cell structure prediction
-        # Each cell can be classified into different types (empty, header, data, etc.)
-        num_cell_types = 5  # Example: empty, header, data, merged, spanning
-        self.classifier = nn.Linear(512, num_cell_types)
+        # Final classification layer for OTSL token prediction
+        # OTSL tokens: fcel, ecel, lcel, nl (4 types)
+        self.otsl_vocab = {'fcel': 0, 'ecel': 1, 'lcel': 2, 'nl': 3}
+        self.classifier = nn.Linear(512, len(self.otsl_vocab))
         
     def forward(self, x, grid_cells):
         """
@@ -655,17 +655,17 @@ class Merge(nn.Module):
         
         print(f"Transformer output shape: {transformer_output.shape}")
         
-        # Final classification for cell types
-        cell_predictions = self.classifier(transformer_output)  # [batch, R*C, num_cell_types]
+        # Final classification for OTSL tokens
+        otsl_predictions = self.classifier(transformer_output)  # [batch, R*C, 4]
         
-        print(f"Cell predictions shape: {cell_predictions.shape}")
+        print(f"OTSL predictions shape: {otsl_predictions.shape}")
         
         return {
             'fpn_features': fpn_features,
             'cell_features': cell_features,      # [R*C, 256, 7, 7] 
             'cell_embeddings': cell_embeddings,  # [R*C, 512]
             'transformer_output': transformer_output,  # [batch, R*C, 512]
-            'cell_predictions': cell_predictions,     # [batch, R*C, num_cell_types]
+            'otsl_predictions': otsl_predictions,     # [batch, R*C, 4]
             'rois': rois
         }
        
@@ -752,33 +752,33 @@ def main(image_path):
     with torch.no_grad():
         merge_outputs = merge_model(img_tensor, grid_cells)
         
-        cell_predictions = merge_outputs['cell_predictions']  # [1, R*C, 5]
+        otsl_predictions = merge_outputs['otsl_predictions']  # [1, R*C, 4]
         
-        # Get predicted cell types
-        predicted_types = torch.argmax(cell_predictions, dim=-1)[0]  # [R*C]
+        # Get predicted OTSL tokens
+        predicted_tokens = torch.argmax(otsl_predictions, dim=-1)[0]  # [R*C]
         
-        print(f"Cell predictions shape: {cell_predictions.shape}")
-        print(f"Predicted cell types: {predicted_types}")
+        print(f"OTSL predictions shape: {otsl_predictions.shape}")
+        print(f"Predicted OTSL tokens: {predicted_tokens}")
         
     # Step 6: Visualize results
     visualize_complete_results(img, row_positions, col_positions, 
-                             grid_cells, predicted_types, num_rows, num_cols)
+                             grid_cells, predicted_tokens, num_rows, num_cols)
     
     return {
         'split_outputs': split_outputs,
         'merge_outputs': merge_outputs,
         'grid_cells': grid_cells,
-        'predicted_types': predicted_types
+        'predicted_tokens': predicted_tokens
     }
 
 def visualize_complete_results(original_image, row_positions, col_positions, 
-                             grid_cells, predicted_types, num_rows, num_cols):
+                             grid_cells, predicted_tokens, num_rows, num_cols):
     """Visualize complete TABLET results"""
     import matplotlib.pyplot as plt
     
-    # Cell type mapping
-    cell_type_names = ['Empty', 'Header', 'Data', 'Merged', 'Spanning']
-    cell_colors = ['white', 'lightblue', 'lightgreen', 'lightyellow', 'lightcoral']
+    # OTSL token mapping
+    token_names = ['fcel', 'ecel', 'lcel', 'nl']
+    token_colors = ['lightgreen', 'white', 'lightblue', 'lightcoral']
     
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
     
@@ -803,8 +803,8 @@ def visualize_complete_results(original_image, row_positions, col_positions,
     for i, row in enumerate(grid_cells):
         for j, cell in enumerate(row):
             cell_idx = i * num_cols + j
-            if cell_idx < len(predicted_types):
-                cell_type = predicted_types[cell_idx].item()
+            if cell_idx < len(predicted_tokens):
+                token_type = predicted_tokens[cell_idx].item()
                 
                 # Scale coordinates back to original image size
                 x1 = int(cell['col_start'] * img_w / 960)
@@ -812,37 +812,37 @@ def visualize_complete_results(original_image, row_positions, col_positions,
                 x2 = int(cell['col_end'] * img_w / 960)
                 y2 = int(cell['row_end'] * img_h / 960)
                 
-                # Draw colored rectangle for cell type
+                # Draw colored rectangle for OTSL token
                 rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
-                                   facecolor=cell_colors[cell_type], 
+                                   facecolor=token_colors[token_type], 
                                    alpha=0.6, edgecolor='black')
                 axes[0, 1].add_patch(rect)
                 
-                # Add cell type label
+                # Add OTSL token label
                 axes[0, 1].text((x1+x2)/2, (y1+y2)/2, 
-                              cell_type_names[cell_type], 
+                              token_names[token_type], 
                               ha='center', va='center', fontsize=8)
     
-    axes[0, 1].set_title('Cell Type Classification')
+    axes[0, 1].set_title('OTSL Token Classification')
     axes[0, 1].axis('off')
     
-    # Cell type distribution
-    type_counts = torch.bincount(predicted_types, minlength=5)
-    axes[1, 0].bar(cell_type_names, type_counts.numpy(), color=cell_colors)
-    axes[1, 0].set_title('Cell Type Distribution')
+    # OTSL token distribution
+    token_counts = torch.bincount(predicted_tokens, minlength=4)
+    axes[1, 0].bar(token_names, token_counts.numpy(), color=token_colors)
+    axes[1, 0].set_title('OTSL Token Distribution')
     axes[1, 0].set_ylabel('Count')
     
     # Grid structure text summary
     axes[1, 1].text(0.1, 0.8, f'Grid Structure: {num_rows} × {num_cols}', 
                    fontsize=14, weight='bold')
     axes[1, 1].text(0.1, 0.7, f'Total Cells: {num_rows * num_cols}', fontsize=12)
-    axes[1, 1].text(0.1, 0.6, 'Cell Types:', fontsize=12, weight='bold')
+    axes[1, 1].text(0.1, 0.6, 'OTSL Tokens:', fontsize=12, weight='bold')
     
     y_pos = 0.5
-    for i, (name, count) in enumerate(zip(cell_type_names, type_counts)):
+    for i, (name, count) in enumerate(zip(token_names, token_counts)):
         axes[1, 1].text(0.1, y_pos, f'{name}: {count.item()}', 
                        fontsize=11, color=cell_colors[i], 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor=cell_colors[i], alpha=0.7))
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor=token_colors[i], alpha=0.7))
         y_pos -= 0.08
     
     axes[1, 1].set_xlim(0, 1)
